@@ -1,0 +1,6 @@
+# Only used when UNIVERSE = "list" in scanner.py (default scans every US stock).
+# One Yahoo Finance symbol per line. Lines starting with # are ignored.
+EXC
+TSLA
+AAPL
+NVDA
