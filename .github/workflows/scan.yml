@@ -1,0 +1,53 @@
+name: IFVG scan
+
+on:
+  schedule:
+    # Every 30 min (1 min after hourly candles close at :30 and the 4pm close), Mon-Fri, covering US market hours (UTC)
+    - cron: "1,31 13-21 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - id: day
+        run: echo "date=$(TZ=America/New_York date +%F)" >> "$GITHUB_OUTPUT"
+      - name: Restore daily data (rebuilt once per day)
+        id: daily
+        uses: actions/cache/restore@v4
+        with:
+          path: daily.pkl
+          key: daily-${{ steps.day.outputs.date }}
+      - name: Restore sent-alerts memory
+        uses: actions/cache/restore@v4
+        with:
+          path: sent.json
+          key: sent-${{ github.run_id }}
+          restore-keys: sent-
+      - name: Scan
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python scanner.py
+      - name: Save daily data
+        if: steps.daily.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: daily.pkl
+          key: daily-${{ steps.day.outputs.date }}
+      - name: Save sent-alerts memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sent.json
+          key: sent-${{ github.run_id }}
