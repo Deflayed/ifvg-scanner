@@ -3,7 +3,7 @@ name: IFVG scan
 on:
   schedule:
     # Every 30 min (1 min after hourly candles close at :30 and the 4pm close), Mon-Fri, covering US market hours (UTC)
-    - cron: "7,37 13-21 * * 1-5"
+    - cron: "7,22,37,52 13-21 * * 1-5"
   workflow_dispatch:
 
 concurrency:
