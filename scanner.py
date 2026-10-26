@@ -1,9 +1,10 @@
 """Free LONG-only IFVG-after-HTF-FVG-sweep scanner -> Discord.
 
-Setup per timeframe (1H, 2H, 3H, 4H, Daily, Weekly):
+Setup per timeframe (30m, 45m, 1H, 2H, 3H, 4H, Daily, Weekly):
   A candle takes out a prior swing LOW while wicking into a bullish FVG from ANY
   higher timeframe, then within MAX_BARS candles a bearish FVG on the same timeframe
-  gets a body close above it (bullish IFVG).
+  gets a body close above it (bullish IFVG), with no unfilled bearish FVG or volume
+  imbalance left above it (same timeframe, or a higher timeframe close above price).
 Weekly setups use Monthly FVGs as the higher timeframe. Only closed candles are used.
 
 Universe: every US-listed stock (Nasdaq + NYSE + AMEX), filtered once a day by price
@@ -26,18 +27,21 @@ UNIVERSE = "all"         # "all" = every US-listed stock, "list" = tickers.txt
 MIN_PRICE = 5.0          # skip stocks below this price
 MIN_AVG_VOLUME = 500_000 # skip stocks trading fewer shares/day than this (20-day avg)
 INCLUDE_ETFS = False
-ALERT_TFS = ["1H", "2H", "3H", "4H", "Daily", "Weekly"]  # remove some to get fewer alerts
+ALERT_TFS = ["30m", "45m", "1H", "2H", "3H", "4H", "Daily", "Weekly"]  # remove some to get fewer alerts
 MIN_GAP_ATR = 0.25       # ignore FVGs smaller than this x ATR14 of their timeframe
+MIN_VI_ATR = 0.05        # ignore volume imbalances smaller than this x ATR14 of their timeframe
 SWING = 3                # swing strength: bars on each side
 MAX_BARS = 8             # max candles from sweep to IFVG
-MAX_ZONES = 5            # higher-TF bullish FVGs kept per timeframe
+MAX_ZONES = 5            # higher-TF FVGs kept per timeframe & side
+BLOCK_HTF_ATR = 3.0      # skip if a higher-TF bearish FVG/VI sits within this many ATRs above the IFVG close (0 = off)
+MAX_CHARTS = 40          # chart pictures per run; extra alerts are sent as text only
 LOOKBACK_MIN = 90        # only send signals whose candle closed within this many minutes
-INTRADAY_PERIOD = "90d"  # 1H history pulled each run
+INTRADAY_PERIOD = "60d"  # 15m history pulled each run (Yahoo max)
 BATCH = 150              # tickers per Yahoo download request
 
 TZ = ZoneInfo("America/New_York")
-TF_NAMES = ["1H", "2H", "3H", "4H", "Daily", "Weekly", "Monthly"]
-INTRADAY_MINUTES = [60, 120, 180, 240]
+TF_NAMES = ["30m", "45m", "1H", "2H", "3H", "4H", "Daily", "Weekly", "Monthly"]
+INTRADAY_MINUTES = [30, 45, 60, 120, 180, 240]
 HERE = Path(__file__).parent
 SENT_FILE = HERE / "sent.json"
 DAILY_FILE = HERE / "daily.pkl"
@@ -156,12 +160,12 @@ def period_bars(dfd, now, freq):
     return b[b["end"] <= now]
 
 
-def build_tf_bars(df1h, dfd, now):
-    # Days covered by the 1H data are rebuilt from it, so today's daily candle is current
-    first = df1h.index.normalize().min()
-    recent = _ohlc(df1h, df1h.index.normalize()).rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close"})
+def build_tf_bars(df15, dfd, now):
+    # Days covered by the 15m data are rebuilt from it, so today's daily candle is current
+    first = df15.index.normalize().min()
+    recent = _ohlc(df15, df15.index.normalize()).rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close"})
     dfd = pd.concat([dfd[dfd.index < first], recent])
-    return ([intraday_bars(df1h, m, now) for m in INTRADAY_MINUTES]
+    return ([intraday_bars(df15, m, now) for m in INTRADAY_MINUTES]
             + [daily_bars(dfd, now), period_bars(dfd, now, "W-FRI"), period_bars(dfd, now, "M")])
 
 
@@ -179,32 +183,48 @@ def atr(h, l, c, n=14):
 
 
 def analyze(b):
-    h, l, c = b["h"].to_numpy(), b["l"].to_numpy(), b["c"].to_numpy()
+    o, h, l, c = b["o"].to_numpy(), b["h"].to_numpy(), b["l"].to_numpy(), b["c"].to_numpy()
     a = atr(h, l, c)
-    bear_tops = []
+    bears = []  # unfilled bearish FVGs on this timeframe: dicts top, bot, i0
+    vis = []    # unfilled bearish volume imbalances (body gaps): dicts top, bot
     swing_lo = None
     rows = []
     for i in range(len(b)):
         min_gap = a[i] * MIN_GAP_ATR
         bull_fvg = i >= 2 and l[i] > h[i - 2] and (l[i] - h[i - 2]) >= min_gap
         bear_fvg = i >= 2 and h[i] < l[i - 2] and (l[i - 2] - h[i]) >= min_gap
+        # Bearish volume imbalance: this body opens fully below the previous body, wicks overlap
+        vi_top = min(o[i - 1], c[i - 1]) if i >= 1 else None
+        vi_bot = max(o[i], c[i])
+        bear_vi = (i >= 1 and vi_top > vi_bot and l[i - 1] <= h[i]
+                   and (vi_top - vi_bot) >= a[i] * MIN_VI_ATR)
 
-        # Bullish IFVG: body close above a recent bearish FVG
-        ifvg_bull = any(c[i] > t for t in bear_tops)
-        bear_tops = [t for t in bear_tops if c[i] <= t]
+        # Bullish IFVG: body close above a recent bearish FVG. Any bearish FVG still
+        # unfilled above it afterwards blocks the setup (price can reject off it).
+        inverted = [f for f in bears if c[i] > f["top"]]
+        bears = [f for f in bears if c[i] <= f["top"] and h[i] < f["top"]]
+        vis = [v for v in vis if c[i] <= v["top"] and h[i] < v["top"]]
+        ifvg = max(inverted, key=lambda f: f["top"]) if inverted else None
+        blocked = bool(bears) or bool(vis)
         if bear_fvg:
-            bear_tops = (bear_tops + [l[i - 2]])[-5:]
+            bears = (bears + [dict(top=l[i - 2], bot=h[i], i0=i - 2)])[-5:]
+        if bear_vi:
+            vis = (vis + [dict(top=vi_top, bot=vi_bot)])[-5:]
 
         k = i - SWING
         if k >= SWING and l[k] < l[k - SWING:k].min() and l[k] <= l[k + 1:i + 1].min():
-            swing_lo = l[k]
-        sweep_low = swing_lo is not None and l[i] < swing_lo
+            swing_lo = (l[k], k)
+        sweep_low = swing_lo is not None and l[i] < swing_lo[0]
+        swept = swing_lo
         if sweep_low:
             swing_lo = None
 
-        rows.append(dict(l=l[i], c=c[i], end=b["end"].iloc[i],
+        rows.append(dict(idx=i, h=h[i], l=l[i], c=c[i], atr=a[i], end=b["end"].iloc[i],
                          bull_fvg=bull_fvg, bull_top=l[i], bull_bot=h[i - 2] if i >= 2 else None,
-                         sweep_low=sweep_low, ifvg_bull=ifvg_bull))
+                         bear_fvg=bear_fvg, bear_top=l[i - 2] if i >= 2 else None, bear_bot=h[i],
+                         bear_vi=bear_vi, vi_top=vi_top, vi_bot=vi_bot,
+                         sweep_low=sweep_low, swept=swept if sweep_low else None,
+                         ifvg_bull=ifvg is not None, ifvg=ifvg, blocked=blocked))
     return rows
 
 
@@ -212,30 +232,111 @@ def find_signals(ticker, tf_bars):
     """tf_bars: one bar DataFrame per TF_NAMES entry. Replays all TFs in close-time order."""
     events = [(r["end"], i, r) for i, b in enumerate(tf_bars) for r in analyze(b)]
     events.sort(key=lambda e: (e[0], e[1]))
-    zones = []  # bullish FVGs: dicts tf, top, bot
+    zones = []  # higher-TF FVGs/VIs: dicts tf, bull, vi, top, bot, t (time it formed)
     n = len(TF_NAMES)
     cnt = [0] * n
-    arm, arm_src = [-1000] * n, [""] * n
+    arm, arm_info = [-1000] * n, [None] * n
     signals = []
     for end, i, r in events:
         cnt[i] += 1
         if i < n - 1:  # the top timeframe (Monthly) only supplies FVGs
             if r["sweep_low"]:
-                hits = [z["tf"] for z in zones if z["tf"] > i and r["l"] <= z["top"] and r["c"] >= z["bot"]]
+                hits = [z for z in zones if z["bull"] and not z["vi"] and z["tf"] > i and r["l"] <= z["top"] and r["c"] >= z["bot"]]
                 if hits:
-                    arm[i], arm_src[i] = cnt[i], TF_NAMES[max(hits)]
+                    arm[i] = cnt[i]
+                    arm_info[i] = dict(zone=max(hits, key=lambda z: z["tf"]), sweep_idx=r["idx"],
+                                       swing_level=r["swept"][0], swing_idx=r["swept"][1])
             if r["ifvg_bull"] and cnt[i] - arm[i] <= MAX_BARS:
-                signals.append(dict(ticker=ticker, tf=TF_NAMES[i], src=arm_src[i], close=r["c"], end=end))
+                near = r["c"] + BLOCK_HTF_ATR * r["atr"]
+                htf_block = BLOCK_HTF_ATR > 0 and any(not z["bull"] and z["tf"] > i and z["top"] > r["c"] and z["bot"] <= near for z in zones)
+                if not r["blocked"] and not htf_block:
+                    info = arm_info[i]
+                    signals.append(dict(ticker=ticker, tf=TF_NAMES[i], tf_idx=i, src=TF_NAMES[info["zone"]["tf"]],
+                                        close=r["c"], end=end, idx=r["idx"], ifvg=r["ifvg"], **info))
                 arm[i] = -1000
 
-        zones = [z for z in zones if not (z["tf"] == i and r["c"] < z["bot"])]
+        # Maintain this timeframe's FVGs (used as higher-TF zones by lower timeframes)
+        zones = [z for z in zones if not (z["tf"] == i and (
+            (z["bull"] and r["c"] < z["bot"]) or (not z["bull"] and (r["c"] > z["top"] or r["h"] >= z["top"]))))]
         if i >= 1:
             if r["bull_fvg"]:
-                zones.append(dict(tf=i, top=r["bull_top"], bot=r["bull_bot"]))
-            mine = [z for z in zones if z["tf"] == i]
-            for z in mine[:-MAX_ZONES]:
-                zones.remove(z)
+                zones.append(dict(tf=i, bull=True, vi=False, top=r["bull_top"], bot=r["bull_bot"], t=end))
+            if r["bear_fvg"]:
+                zones.append(dict(tf=i, bull=False, vi=False, top=r["bear_top"], bot=r["bear_bot"], t=end))
+            if r["bear_vi"]:
+                zones.append(dict(tf=i, bull=False, vi=True, top=r["vi_top"], bot=r["vi_bot"], t=end))
+            for bull, vi in ((True, False), (False, False), (False, True)):
+                mine = [z for z in zones if z["tf"] == i and z["bull"] == bull and z["vi"] == vi]
+                for z in mine[:-MAX_ZONES]:
+                    zones.remove(z)
     return signals
+
+
+# ── Charts ───────────────────────────────────────────────────────────────────
+def chart_png(b, s):
+    """TradingView-style picture of the setup on its own timeframe. Returns PNG bytes."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    lo = max(0, min(s["swing_idx"], s["ifvg"]["i0"], s["sweep_idx"]) - 25)
+    hi = s["idx"]
+    w = b.iloc[lo:hi + 1]
+    x = np.arange(len(w))
+    right = len(w) + 6
+    bg, grid, txt = "#131722", "#2a2e39", "#d1d4dc"
+    up, down = "#26a69a", "#ef5350"
+
+    fig, ax = plt.subplots(figsize=(10, 5.4), dpi=110)
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    for xi, (o, h, l, c) in zip(x, w[["o", "h", "l", "c"]].to_numpy()):
+        col = up if c >= o else down
+        ax.vlines(xi, l, h, color=col, linewidth=1)
+        ax.add_patch(Rectangle((xi - 0.35, min(o, c)), 0.7, max(abs(c - o), 1e-9), color=col))
+
+    # Higher-TF bullish FVG
+    z = s["zone"]
+    zx = int(np.searchsorted(w["end"].to_numpy(), np.datetime64(z["t"])))
+    zx = min(max(zx, 0), len(w) - 1)
+    ax.add_patch(Rectangle((zx - 0.5, z["bot"]), right - zx, z["top"] - z["bot"], color="#2962ff", alpha=0.18, lw=0))
+    ax.text(right - 0.5, z["top"], f"{s['src']} FVG", color="#5b8cff", fontsize=9, ha="right", va="bottom")
+
+    # Inverted FVG
+    f = s["ifvg"]
+    fx = f["i0"] - lo
+    ax.add_patch(Rectangle((fx - 0.5, f["bot"]), right - fx, f["top"] - f["bot"], color="#26a69a", alpha=0.25, lw=0))
+    ax.text(right - 0.5, f["bot"], "IFVG", color=up, fontsize=9, ha="right", va="top")
+
+    # Swept swing low
+    sx, ex = s["swing_idx"] - lo, s["sweep_idx"] - lo
+    ax.hlines(s["swing_level"], sx, ex, colors="#f0b90b", linestyles="dashed", linewidth=1.2)
+    ax.text(sx, s["swing_level"], "swing low ", color="#f0b90b", fontsize=8, ha="right", va="center")
+    ax.annotate("sweep", (ex, w["l"].iloc[ex]), xytext=(ex, w["l"].iloc[ex] - (w["h"].max() - w["l"].min()) * 0.06),
+                color="#f0b90b", fontsize=8, ha="center", arrowprops=dict(arrowstyle="->", color="#f0b90b"))
+    ax.annotate("IFVG close", (x[-1], w["h"].iloc[-1]), xytext=(x[-1], w["h"].iloc[-1] + (w["h"].max() - w["l"].min()) * 0.08),
+                color=up, fontsize=8, ha="center", arrowprops=dict(arrowstyle="->", color=up))
+
+    span = w["h"].max() - w["l"].min()
+    ax.set_ylim(min(w["l"].min(), f["bot"]) - span * 0.12, max(w["h"].max(), f["top"]) + span * 0.15)
+    ax.set_xlim(-1, right)
+    step = max(1, len(w) // 8)
+    ax.set_xticks(x[::step])
+    fmt = "%b %d" if s["tf"] in ("Daily", "Weekly") else "%b %d %H:%M"
+    ax.set_xticklabels([t.strftime(fmt) for t in w.index[::step]], fontsize=8)
+    ax.yaxis.tick_right()
+    ax.tick_params(colors=txt, labelsize=8)
+    ax.grid(color=grid, linewidth=0.6)
+    for sp in ax.spines.values():
+        sp.set_color(grid)
+    ax.set_title(f"{s['ticker']}  ·  {s['tf']}  ·  bullish IFVG after sweep into {s['src']} FVG",
+                 color=txt, fontsize=11, loc="left")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=bg)
+    plt.close(fig)
+    return buf.getvalue()
 
 
 # ── Discord ──────────────────────────────────────────────────────────────────
@@ -244,22 +345,34 @@ def format_signal(s):
             f"{s['src']} bullish FVG | Close: {s['close']:.2f}")
 
 
-def send_discord(webhook, lines):
+def _post(webhook, **kw):
     import requests
-    chunks, chunk = [], ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 1900:
-            chunks.append(chunk)
+    for _ in range(5):
+        r = requests.post(webhook, timeout=30, **kw)
+        if r.status_code != 429:  # 429 = Discord rate limit
+            r.raise_for_status()
+            break
+        time.sleep(float(r.json().get("retry_after", 2)))
+    time.sleep(0.7)
+
+
+def send_discord(webhook, items):
+    """items: list of (text, png_bytes or None)."""
+    text_only = []
+    for text, png in items:
+        if png is None:
+            text_only.append(text)
+            continue
+        _post(webhook, data={"payload_json": json.dumps({"content": text})},
+              files={"files[0]": ("setup.png", png, "image/png")})
+    chunk = ""
+    for line in text_only + [None]:
+        if line is None or len(chunk) + len(line) + 1 > 1900:
+            if chunk:
+                _post(webhook, json={"content": chunk})
             chunk = ""
-        chunk += line + "\n"
-    chunks.append(chunk)
-    for ch in chunks:
-        r = requests.post(webhook, json={"content": ch}, timeout=20)
-        if r.status_code == 429:  # Discord rate limit
-            time.sleep(float(r.json().get("retry_after", 2)))
-            r = requests.post(webhook, json={"content": ch}, timeout=20)
-        r.raise_for_status()
-        time.sleep(1)
+        if line is not None:
+            chunk += line + "\n"
 
 
 def main():
@@ -270,28 +383,38 @@ def main():
     daily = load_daily(now.date().isoformat())
     tickers = sorted(daily)
     print(f"scanning {len(tickers)} stocks", file=sys.stderr)
-    intr = download(tickers, "60m", INTRADAY_PERIOD)
+    intr = download(tickers, "15m", INTRADAY_PERIOD)
 
     new = []
     for t in tickers:
         if t not in intr:
             continue
         try:
-            signals = find_signals(t, build_tf_bars(intr[t], daily[t], now))
+            bars = build_tf_bars(intr[t], daily[t], now)
+            signals = find_signals(t, bars)
         except Exception as e:
             print(f"{t}: {e!r}", file=sys.stderr)
             continue
         for s in signals:
+            s["bars"] = bars[s["tf_idx"]]
             key = f"{s['ticker']}|{s['tf']}|{s['end']:%Y-%m-%d %H:%M}"
             if s["tf"] in ALERT_TFS and s["end"] >= now - timedelta(minutes=LOOKBACK_MIN) and key not in sent:
                 new.append(s)
                 sent[key] = now.isoformat()
 
     new.sort(key=lambda s: TF_NAMES.index(s["tf"]), reverse=True)  # higher timeframes first
-    lines = [format_signal(s) for s in new]
-    print("\n".join(lines) or "no new signals")
-    if lines and webhook:
-        send_discord(webhook, lines)
+    items = []
+    for k, s in enumerate(new):
+        png = None
+        if k < MAX_CHARTS:
+            try:
+                png = chart_png(s["bars"], s)
+            except Exception as e:
+                print(f"chart {s['ticker']}: {e!r}", file=sys.stderr)
+        items.append((format_signal(s), png))
+    print("\n".join(t for t, _ in items) or "no new signals")
+    if items and webhook:
+        send_discord(webhook, items)
 
     cutoff = (now - timedelta(days=7)).isoformat()
     SENT_FILE.write_text(json.dumps({k: v for k, v in sent.items() if v >= cutoff}, indent=0))
