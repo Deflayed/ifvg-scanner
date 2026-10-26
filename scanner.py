@@ -35,6 +35,7 @@ MAX_BARS = 8             # max candles from sweep to IFVG
 MAX_ZONES = 5            # higher-TF FVGs kept per timeframe & side
 BLOCK_HTF_ATR = 3.0      # skip if a higher-TF bearish FVG/VI sits within this many ATRs above the IFVG close (0 = off)
 MAX_CHARTS = 40          # chart pictures per run; extra alerts are sent as text only
+PING_ROLE_ID = "1564331113688862850"  # Discord role ID to @mention once per batch of alerts ("" = no ping)
 LOOKBACK_MIN = 90        # only send signals whose candle closed within this many minutes
 INTRADAY_PERIOD = "60d"  # 15m history pulled each run (Yahoo max)
 BATCH = 150              # tickers per Yahoo download request
@@ -369,19 +370,23 @@ def _post(webhook, **kw):
 
 
 def send_discord(webhook, items):
-    """items: list of (text, png_bytes or None)."""
+    """items: list of (text, png_bytes or None). The first message pings PING_ROLE_ID."""
+    ping = f"<@&{PING_ROLE_ID}> " if PING_ROLE_ID else ""
+    mentions = {"roles": [PING_ROLE_ID] if PING_ROLE_ID else []}
+    if ping:
+        items = [(ping + items[0][0], items[0][1])] + items[1:]
     text_only = []
     for text, png in items:
         if png is None:
             text_only.append(text)
             continue
-        _post(webhook, data={"payload_json": json.dumps({"content": text})},
+        _post(webhook, data={"payload_json": json.dumps({"content": text, "allowed_mentions": mentions})},
               files={"files[0]": ("setup.png", png, "image/png")})
     chunk = ""
     for line in text_only + [None]:
         if line is None or len(chunk) + len(line) + 1 > 1900:
             if chunk:
-                _post(webhook, json={"content": chunk})
+                _post(webhook, json={"content": chunk, "allowed_mentions": mentions})
             chunk = ""
         if line is not None:
             chunk += line + "\n"
